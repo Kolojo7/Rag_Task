@@ -103,5 +103,5 @@ Preview (drop your own PDF/TXT!)
 
 ## 💙 Team / Credits
 
-- Built with love for the Roo‑Code Hackathon
+- Current direction: evolving toward a C++-based RAG implementation
 

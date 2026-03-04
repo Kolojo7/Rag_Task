@@ -11,10 +11,10 @@ from typing import List, Dict, Any
 from urllib.parse import quote_plus
 
 # Simple Flask backend that:
-# 1) Extracts text from an uploaded PDF/TXT
-# 2) Summarizes it (summary, key points, ELI5, action items)
+# 1) Extracts text from an uploaded dataset file
+# 2) Summarizes it (kept available for future UI use)
 # 3) Builds a lightweight RAG index (embeddings + chunks) so the chat can
-#    answer questions grounded in the paper and (optionally) its references.
+#    answer questions grounded in the uploaded content.
 
 load_dotenv()  # pull in GEMINI_API_KEY from backend/.env
 
@@ -25,18 +25,19 @@ CORS(app)  # allow frontend (Vite dev server) to call our API during dev
 # -----------------------
 # RAG In-Memory State
 # -----------------------
-# Holds the most recently uploaded paper and optional referenced docs
-# (This is intentionally simple and in-memory. If you restart the server, you
-#  need to upload again. Could be swapped for a persistent store.)
+# Holds the most recently uploaded dataset and optional referenced docs.
+# This is intentionally simple and in-memory. If you restart the server, you
+# need to upload again.
 RAG_STATE = {
     "chunks": [],            # List[str]
     "embeddings": [],        # List[List[float]]
     "metas": [],             # List[Dict]
-    "paper_text": "",        # Full text of uploaded paper
+    "paper_text": "",        # Full text of uploaded content
 }
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # used for embeddings + generation
-USER_AGENT = os.getenv("USER_AGENT", "RooRAG/1.0 (+https://example.com)")
+USER_AGENT = os.getenv("USER_AGENT", "CppRAGWorkspace/1.0 (+https://example.com)")
+TEXT_UPLOAD_EXTENSIONS = (".txt", ".text", ".csv", ".md", ".markdown")
 
 # Google Generative Language API endpoints (Gemini)
 EMBEDDING_MODEL_ENDPOINT = (
@@ -53,16 +54,13 @@ def health():
 
 
 def _chunk_text(text: str, max_chars: int = 1200, overlap: int = 120) -> List[str]:
-    """Split a long string into overlapping windows to index for retrieval.
-    Roughly tries to end on sentence boundaries so chunks read nicely.
-    """
+    """Split a long string into overlapping windows to index for retrieval."""
     text = re.sub(r"\s+", " ", text).strip()
     chunks = []
     i = 0
     n = len(text)
     while i < n:
         end = min(i + max_chars, n)
-        # try to break at sentence boundary
         window = text[i:end]
         if end < n:
             m = re.search(r"[.!?]\s+[^.!?]{0,80}$", window)
@@ -106,11 +104,7 @@ def _cosine(a: List[float], b: List[float]) -> float:
 
 
 def _search_similar(question: str, k: int = 5):
-    """Retrieve top-k chunks for a question.
-    If embeddings look weak (e.g., all tiny scores), fall back to paper-first
-    chunks so the model always sees real content from the uploaded doc.
-    """
-    # Robust retrieval with fallback favoring the uploaded paper
+    """Retrieve top-k chunks for a question with a paper-first fallback."""
     qvec = _embed_text(question)
     scored = []
     valid_positive = False
@@ -121,11 +115,9 @@ def _search_similar(question: str, k: int = 5):
         scored.append((score, i))
     scored.sort(reverse=True)
 
-    indices: list[int]
     if qvec and valid_positive:
         indices = [idx for _, idx in scored[:k]]
     else:
-        # Fallback: take first k chunks from the actual paper, then fill with refs
         paper_idxs = [i for i, m in enumerate(RAG_STATE["metas"]) if m.get("source") == "paper"]
         ref_idxs = [i for i, m in enumerate(RAG_STATE["metas"]) if m.get("source", "").startswith("ref:")]
         indices = (paper_idxs[:k] + ref_idxs[:k])[:k]
@@ -138,7 +130,6 @@ def _search_similar(question: str, k: int = 5):
 def _strip_html(html: str) -> str:
     """Very naive HTML -> text cleaner for reference pages."""
     try:
-        # very naive HTML to text
         text = re.sub(r"<script[\s\S]*?</script>", " ", html, flags=re.I)
         text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.I)
         text = re.sub(r"<[^>]+>", " ", text)
@@ -149,10 +140,7 @@ def _strip_html(html: str) -> str:
 
 
 def _fetch_reference_text(url: str) -> str:
-    """Fetch and extract text from a reference URL.
-    - If it's a PDF, we parse it with PyMuPDF.
-    - Else we pull the HTML and strip tags.
-    """
+    """Fetch and extract text from a reference URL."""
     try:
         r = requests.get(url, timeout=30, headers={"User-Agent": USER_AGENT})
         r.raise_for_status()
@@ -160,9 +148,7 @@ def _fetch_reference_text(url: str) -> str:
         if "pdf" in ctype or url.lower().endswith(".pdf"):
             doc = fitz.open(stream=r.content, filetype="pdf")
             return "\n".join(page.get_text() for page in doc)
-        else:
-            text = r.text
-            return _strip_html(text)
+        return _strip_html(r.text)
     except Exception as e:
         print("Ref fetch error:", url, str(e))
         return ""
@@ -170,7 +156,6 @@ def _fetch_reference_text(url: str) -> str:
 
 def _extract_reference_urls(full_text: str) -> List[str]:
     """Heuristic scan for URLs/DOIs in the paper's References/Bibliography."""
-    # Find references section heuristically
     lower = full_text.lower()
     idx = lower.rfind("references")
     if idx == -1:
@@ -180,7 +165,6 @@ def _extract_reference_urls(full_text: str) -> List[str]:
     urls = set()
     for m in re.finditer(r"https?://[^\s)\]]+", ref_block):
         urls.add(m.group(0).rstrip(".,);]"))
-    # DOIs
     for m in re.finditer(r"10\.\d{4,9}/\S+", ref_block):
         doi = m.group(0).rstrip(".,);]")
         urls.add(f"https://doi.org/{doi}")
@@ -211,11 +195,11 @@ def _augment_with_references(full_text: str, max_refs: int = 3):
             texts.append(t)
     if not texts:
         return []
-    # Append to existing state
+
     new_chunks = []
     new_metas = []
     for i, t in enumerate(texts):
-        label = f"ref:{i+1}"
+        label = f"ref:{i + 1}"
         for c in _chunk_text(t):
             new_chunks.append(c)
             new_metas.append({"source": label})
@@ -230,21 +214,25 @@ def _answer_with_context(question: str) -> Dict[str, Any]:
     """Assemble a grounded prompt from retrieved chunks and ask Gemini."""
     if not GEMINI_API_KEY:
         return {"answer": "Missing GEMINI_API_KEY.", "sources": []}
+
     contexts, metas = _search_similar(question, k=6)
-    # Always prepend a brief intro from the paper itself as an anchor
     intro = (RAG_STATE.get("paper_text") or "").strip()[:1200]
     if intro:
         contexts = [intro] + contexts
         metas = [{"source": "paper:intro"}] + metas
+
     system = (
         "You are an expert assistant for research papers. "
-        "Use ONLY the given source snippets, which come from the uploaded paper and (when available) its cited references. "
-        "Prioritize the uploaded paper; draw on cited references only to supplement details present in the sources. "
-        "If the sources do not contain sufficient information to answer, say you don't have enough information. "
-        "Answer as a domain expert: precise, concise, and technically accurate. Also giving more context for the user to understand "
+        "Use ONLY the given source snippets, which come from the uploaded paper and "
+        "(when available) its cited references. "
+        "Prioritize the uploaded paper; draw on cited references only to supplement "
+        "details present in the sources. "
+        "If the sources do not contain sufficient information to answer, say you do "
+        "not have enough information. "
+        "Answer as a domain expert: precise, concise, and technically accurate. "
         "Cite supporting snippets using [S1], [S2], ... markers tied to the provided sources."
     )
-    sources_text = "\n\n".join([f"[S{i+1}] {c}" for i, c in enumerate(contexts)])
+    sources_text = "\n\n".join([f"[S{i + 1}] {c}" for i, c in enumerate(contexts)])
     user = f"Question: {question}\n\nSources:\n{sources_text}"
 
     headers = {"Content-Type": "application/json", "X-Goog-Api-Key": GEMINI_API_KEY}
@@ -259,7 +247,7 @@ def _answer_with_context(question: str) -> Dict[str, Any]:
         r = requests.post(GENERATE_ENDPOINT, headers=headers, json=payload, timeout=60)
         r.raise_for_status()
         data = r.json()
-        text = data['candidates'][0]['content']['parts'][0]['text']
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
         return {"answer": text, "sources": [m.get("source", "S") for m in metas]}
     except Exception as e:
         print("Ask error:", str(e))
@@ -270,22 +258,19 @@ def _answer_with_context(question: str) -> Dict[str, Any]:
 # Web Search (Learn More)
 # -----------------------
 def _ddg_instant_answer(query: str, max_results: int = 5) -> List[Dict[str, str]]:
-    """Use DuckDuckGo Instant Answer API to get related links.
-    Returns a list of {title, url}.
-    """
+    """Use DuckDuckGo Instant Answer API to get related links."""
     url = f"https://api.duckduckgo.com/?q={quote_plus(query)}&format=json&no_html=1&no_redirect=1"
     results: List[Dict[str, str]] = []
     try:
         r = requests.get(url, timeout=20, headers={"User-Agent": USER_AGENT})
         r.raise_for_status()
         data = r.json()
-        # Abstract
+
         abstract_url = (data.get("AbstractURL") or "").strip()
         abstract_text = (data.get("AbstractText") or data.get("Heading") or "").strip()
         if abstract_url and abstract_text:
             results.append({"title": abstract_text, "url": abstract_url})
 
-        # RelatedTopics can be nested
         def _collect_topics(items):
             for it in items or []:
                 if "FirstURL" in it and it.get("Text"):
@@ -307,20 +292,15 @@ def _ddg_instant_answer(query: str, max_results: int = 5) -> List[Dict[str, str]
 
 
 def _ddg_html_search(query: str, max_results: int = 5) -> List[Dict[str, str]]:
-    """Fallback: scrape DuckDuckGo HTML (non-JS) results page for links.
-    Very light regex parsing to avoid adding heavy deps.
-    """
+    """Fallback: scrape DuckDuckGo HTML (non-JS) results page for links."""
     url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
     results: List[Dict[str, str]] = []
     try:
         r = requests.get(url, timeout=20, headers={"User-Agent": USER_AGENT})
         r.raise_for_status()
         html = r.text
-        # Look for anchors with class result__a
-        # Example: <a rel="nofollow" class="result__a" href="https://...">Title</a>
-        for m in re.finditer(r"<a[^>]*class=\"result__a\"[^>]*href=\"([^\"]+)\"[^>]*>(.*?)</a>", html, flags=re.I|re.S):
+        for m in re.finditer(r"<a[^>]*class=\"result__a\"[^>]*href=\"([^\"]+)\"[^>]*>(.*?)</a>", html, flags=re.I | re.S):
             href = re.sub(r"&amp;", "&", m.group(1)).strip()
-            # Strip HTML tags from title
             title = re.sub(r"<[^>]+>", " ", m.group(2))
             title = re.sub(r"\s+", " ", title).strip()
             if href and title:
@@ -337,7 +317,6 @@ def _learn_more_search(query: str, max_results: int = 5) -> List[Dict[str, str]]
     items = _ddg_instant_answer(query, max_results=max_results)
     if len(items) < max_results:
         extra = _ddg_html_search(query, max_results=max_results * 2)
-        # Deduplicate by URL
         seen = set(i["url"] for i in items)
         for it in extra:
             if it["url"] not in seen:
@@ -348,8 +327,39 @@ def _learn_more_search(query: str, max_results: int = 5) -> List[Dict[str, str]]
     return items[:max_results]
 
 
+def _read_uploaded_dataset(file, filename: str) -> str | None:
+    """Extract text from supported dataset file types."""
+    lowered = filename.lower()
+
+    if lowered.endswith(".pdf"):
+        pdf_bytes = file.read()
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            all_pages = [p.get_text() for p in doc]
+
+        def _is_noise_page(s: str) -> bool:
+            low = (s or "").lower()
+            return ("ieee xplore" in low and ("downloaded" in low or "permission" in low or "personal use" in low))
+
+        filtered = []
+        for i, t in enumerate(all_pages):
+            if i < 2 and _is_noise_page(t):
+                continue
+            filtered.append(t)
+
+        if not any(s.strip() for s in filtered):
+            filtered = all_pages
+
+        return "\n".join(filtered)
+
+    if lowered.endswith(TEXT_UPLOAD_EXTENSIONS):
+        return file.read().decode("utf-8", errors="ignore")
+
+    return None
+
+
 @app.route("/api/summarize", methods=["POST"])
-def summarize():
+@app.route("/api/dataset", methods=["POST"])
+def load_dataset():
     try:
         if "file" not in request.files:
             return jsonify({"error": "Missing 'file' field in form-data."}), 400
@@ -359,31 +369,9 @@ def summarize():
 
         print("Received file:", filename)
 
-        text = ""
-        if filename.lower().endswith(".pdf"):
-            # Extract text from PDF and conservatively skip obvious cover/permission pages.
-            # Only skip the first 1–2 pages if they look like boilerplate; never drop all pages.
-            pdf_bytes = file.read()
-            with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-                all_pages = [p.get_text() for p in doc]
-
-            def _is_noise_page(s: str) -> bool:
-                low = (s or "").lower()
-                return ("ieee xplore" in low and ("downloaded" in low or "permission" in low or "personal use" in low))
-
-            filtered = []
-            for i, t in enumerate(all_pages):
-                if i < 2 and _is_noise_page(t):
-                    continue
-                filtered.append(t)
-            # Fallback: if we filtered everything, keep all pages
-            if not any(s.strip() for s in filtered):
-                filtered = all_pages
-            text = "\n".join(filtered)
-        elif filename.lower().endswith(".txt"):
-            text = file.read().decode("utf-8", errors="ignore")
-        else:
-            return jsonify({"error": "Unsupported file type. Please upload a .pdf or .txt."}), 400
+        text = _read_uploaded_dataset(file, filename)
+        if text is None:
+            return jsonify({"error": "Unsupported file type. Please upload a PDF, TXT, CSV, or Markdown file."}), 400
 
         preview = text[:300].replace("\n", " ")
         print("Extracted text preview (300 chars):", preview)
@@ -391,10 +379,8 @@ def summarize():
         if not text.strip():
             return jsonify({"error": "No text extracted from file."}), 400
 
-        # Build RAG index from the uploaded text
         RAG_STATE["paper_text"] = text
         _build_index_from_texts([text], source_label="paper")
-        # Try to augment with references (best-effort)
         refs = _augment_with_references(text)
 
         summary = summarize_text(text)
@@ -405,15 +391,13 @@ def summarize():
         return jsonify(summary)
 
     except Exception as e:
-        print("Error in /api/summarize:", str(e))
-        return jsonify({"error": "Summarization failed."}), 500
+        print("Error in /api/dataset:", str(e))
+        return jsonify({"error": "Dataset load failed."}), 500
 
 
 @app.route("/api/learn", methods=["POST"])
 def learn():
-    """Perform a lightweight web search for the given query and return 4-5 links.
-    Body: {"q": "..."}
-    """
+    """Perform a lightweight web search for the given query and return 4-5 links."""
     try:
         data = request.get_json(force=True)
         q = (data.get("q") or "").strip()
@@ -434,7 +418,7 @@ def ask():
         if not question:
             return jsonify({"error": "Missing 'question'"}), 400
         if not RAG_STATE["chunks"]:
-            return jsonify({"error": "No document loaded. Upload and summarize a paper first."}), 400
+            return jsonify({"error": "No dataset loaded. Upload a dataset first."}), 400
 
         result = _answer_with_context(question)
         return jsonify(result)
@@ -444,5 +428,4 @@ def ask():
 
 
 if __name__ == "__main__":
-    # Default Flask dev server (adjust host/port if needed)
     app.run(debug=True)

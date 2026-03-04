@@ -1,67 +1,31 @@
-import React, { useEffect, useMemo, useState } from "react";
-// renders the tabs (Summary/Key/ELI5/Action/Learn) and the chat mode. Chat calls /api/ask and shows a right sidebar.
+import React, { useState } from "react";
+
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:5000";
 
-export default function ResultsView({ data }) {
-  // tab = which results tab is active; mode = 'results' vs 'chat'
-  const [tab, setTab] = useState("summary");
-  const [mode, setMode] = useState("results"); // 'results' | 'chat'
+export default function ResultsView({
+  data,
+  dataset,
+  loading,
+  onSelectNewDataset,
+  onResetDataset,
+}) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
-  const [sidebarTab, setSidebarTab] = useState(null); // null | 'summary' | 'key' | 'eli5' | 'action' | 'learn'
-  const [learnResults, setLearnResults] = useState({ loading: false, items: [], error: null });
+  const [sending, setSending] = useState(false);
 
-  const summary = data?.summary || "";
-  const key_points = data?.key_points || [];
-  const eli5 = data?.eli5 || "";
-  const action_items = data?.action_items || [];
+  const summaryReady = Boolean(data?.summary?.trim());
+  const datasetName = dataset?.name || "Current dataset";
 
-  // Copy the current tab's content to clipboard
-  const copyCurrent = async () => {
-    let text = "";
-    if (tab === "summary") text = summary;
-    if (tab === "key") text = key_points.map((p) => `• ${p}`).join("\n");
-    if (tab === "eli5") text = eli5;
-    if (tab === "action") text = action_items.map((a) => `• ${a}`).join("\n");
-    try {
-      await navigator.clipboard.writeText(text || "");
-    } catch {}
-  };
-
-  // Build a markdown document and trigger a download
-  const downloadMd = () => {
-    const md = [
-      "# Summary",
-      summary || "",
-      "",
-      "## Key Points",
-      ...key_points.map((p) => `- ${p}`),
-      "",
-      "## Explain Like I'm 5",
-      "",
-      eli5,
-      "",
-      "## Action Items",
-      ...action_items.map((a) => `- ${a}`),
-      "",
-    ].join("\n");
-    const blob = new Blob([md], { type: "text/markdown" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "summary.md";
-    a.click();
-    URL.revokeObjectURL(url);
-  };
-
-  // Chat submit: POST question to backend /api/ask and append reply
   const handleSend = async (e) => {
     e?.preventDefault?.();
     const text = input.trim();
-    if (!text) return;
+    if (!text || sending) return;
+
     const userMsg = { role: "user", content: text, ts: Date.now() };
-    setMessages((m) => [...m, userMsg]);
+    setMessages((current) => [...current, userMsg]);
     setInput("");
+    setSending(true);
+
     try {
       const res = await fetch(`${API_BASE}/api/ask`, {
         method: "POST",
@@ -69,377 +33,138 @@ export default function ResultsView({ data }) {
         body: JSON.stringify({ question: text }),
       });
       const payload = await res.json();
-      const content = payload?.answer || payload?.error || "No answer.";
-      const assistantMsg = { role: "assistant", content, ts: Date.now() };
-      setMessages((m) => [...m, assistantMsg]);
-    } catch (err) {
-      const assistantMsg = { role: "assistant", content: "Error contacting AI.", ts: Date.now() };
-      setMessages((m) => [...m, assistantMsg]);
+      const content = payload?.answer || payload?.error || "No answer yet.";
+      const assistantMsg = { role: "assistant", content, ts: Date.now() + 1 };
+      setMessages((current) => [...current, assistantMsg]);
+    } catch {
+      const assistantMsg = {
+        role: "assistant",
+        content: "Error contacting AI.",
+        ts: Date.now() + 1,
+      };
+      setMessages((current) => [...current, assistantMsg]);
+    } finally {
+      setSending(false);
     }
   };
 
-  const learnTopic = useMemo(() => {
-    if (key_points[0]) return String(key_points[0]).slice(0, 120);
-    const firstSentence = (summary || "").split(/(?<=[.!?])\s+/)[0] || "research topic";
-    return String(firstSentence).slice(0, 120);
-  }, [summary, key_points]);
-
-  // Trigger backend learn-more search when Learn tab (main) or sidebar Learn is active
-  useEffect(() => {
-    if (!(tab === "learn" || sidebarTab === "learn")) return;
-    const q = String(learnTopic || "").trim();
-    if (!q) return;
-    let aborted = false;
-    setLearnResults((s) => ({ ...s, loading: true, error: null }));
-    fetch(`${API_BASE}/api/learn`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ q }),
-    })
-      .then((r) => r.json())
-      .then((data) => {
-        if (aborted) return;
-        const items = Array.isArray(data?.links) ? data.links : [];
-        setLearnResults({ loading: false, items, error: null });
-      })
-      .catch(() => {
-        if (aborted) return;
-        setLearnResults({ loading: false, items: [], error: "Search failed" });
-      });
-    return () => {
-      aborted = true;
-    };
-  }, [tab, sidebarTab, learnTopic]);
-
-  // Fallback static search links (if backend returns nothing)
-  const fallbackLearnLinks = useMemo(() => {
-    const q = encodeURIComponent(learnTopic);
-    return [
-      { title: `DuckDuckGo: ${learnTopic}`, url: `https://duckduckgo.com/?q=${q}` },
-      { title: `YouTube: ${learnTopic}`, url: `https://www.youtube.com/results?search_query=${q}` },
-      { title: `Wikipedia: ${learnTopic}`, url: `https://en.wikipedia.org/w/index.php?search=${q}` },
-      { title: `Stack Overflow: ${learnTopic}`, url: `https://stackoverflow.com/search?q=${q}` },
-    ];
-  }, [learnTopic]);
-
-  // Right-side insights sidebar (shown while chatting)
-  const Sidebar = () => (
-    <>
-      {/* Right sidebar with tabs (visible in chat mode) */}
-      <div
-        className="card"
-        style={{
-          position: "fixed",
-          top: 140,
-          right: 24,
-          width: 220,
-          padding: 12,
-          zIndex: 40,
-        }}
-      >
-        <div style={{ fontWeight: 700, marginBottom: 8 }}>Paper Insights</div>
-        <div
-          className="tabs"
-          style={{ display: "flex", flexDirection: "column", gap: 8 }}
-        >
-          <div
-            className={`tab ${sidebarTab === "summary" ? "active" : ""}`}
-            onClick={() => setSidebarTab("summary")}
-          >
-            📚 Summary
-          </div>
-          <div
-            className={`tab ${sidebarTab === "key" ? "active" : ""}`}
-            onClick={() => setSidebarTab("key")}
-          >
-            🔑 Key Points
-          </div>
-          <div
-            className={`tab ${sidebarTab === "eli5" ? "active" : ""}`}
-            onClick={() => setSidebarTab("eli5")}
-          >
-            👶 ELI5
-          </div>
-          <div
-            className={`tab ${sidebarTab === "action" ? "active" : ""}`}
-            onClick={() => setSidebarTab("action")}
-          >
-            📌 Action Items
-          </div>
-          <div
-            className={`tab ${sidebarTab === "learn" ? "active" : ""}`}
-            onClick={() => setSidebarTab("learn")}
-          >
-            🧠 Learn More
-          </div>
-        </div>
-      </div>
-
-      {sidebarTab && (
-        <div
-          className="card"
-          style={{
-            position: "fixed",
-            top: 140,
-            right: 284,
-            width: 360,
-            padding: 16,
-            zIndex: 41,
-          }}
-        >
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 8,
-              marginBottom: 10,
-            }}
-          >
-            <div style={{ fontWeight: 700, fontSize: 16, flex: 1 }}>
-              {sidebarTab === "summary" && "📚 Summary"}
-              {sidebarTab === "key" && "🔑 Key Points"}
-              {sidebarTab === "eli5" && "👶 Explain Like I'm 5"}
-              {sidebarTab === "action" && "📌 Action Items"}
-              {sidebarTab === "learn" && "🧠 Learn More"}
-            </div>
-            <button
-              className="button"
-              onClick={() => setSidebarTab(null)}
-              style={{ padding: "6px 10px" }}
-            >
-              Close
-            </button>
-          </div>
-          {sidebarTab === "summary" && (
-            <div style={{ whiteSpace: "pre-wrap" }}>{summary}</div>
-          )}
-          {sidebarTab === "key" && (
-            <ul style={{ margin: 0, paddingLeft: 18 }}>
-              {key_points.map((p, i) => (
-                <li key={i}>{p}</li>
-              ))}
-            </ul>
-          )}
-          {sidebarTab === "eli5" && (
-            <div style={{ whiteSpace: "pre-wrap" }}>{eli5}</div>
-          )}
-          {sidebarTab === "action" && (
-            <ul style={{ margin: 0, paddingLeft: 18 }}>
-              {action_items.map((a, i) => (
-                <li key={i}>{a}</li>
-              ))}
-            </ul>
-          )}
-          {sidebarTab === "learn" && (
-            <div>
-              {learnResults.loading && (
-                <div style={{ color: "#94a3b8", marginBottom: 6 }}>Searching…</div>
-              )}
-              <ul style={{ margin: 0, paddingLeft: 18 }}>
-                {(learnResults.items.length ? learnResults.items : fallbackLearnLinks).map((l, i) => (
-                  <li key={i}>
-                    <a href={l.url} target="_blank" rel="noreferrer">
-                      {l.title || l.label || l.url}
-                    </a>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-        </div>
-      )}
-    </>
-  );
-
   return (
-    <>
-      {mode === "results" && (
-        <div className="card results">
-          <div className="tabs">
-            <div
-              className={`tab ${tab === "summary" ? "active" : ""}`}
-              onClick={() => setTab("summary")}
-            >
-              📚 Summary
-            </div>
-            <div
-              className={`tab ${tab === "key" ? "active" : ""}`}
-              onClick={() => setTab("key")}
-            >
-              🔑 Key Points
-            </div>
-            <div
-              className={`tab ${tab === "eli5" ? "active" : ""}`}
-              onClick={() => setTab("eli5")}
-            >
-              👶 ELI5
-            </div>
-            <div
-              className={`tab ${tab === "action" ? "active" : ""}`}
-              onClick={() => setTab("action")}
-            >
-              📌 Action Items
-            </div>
-            <div
-              className={`tab ${tab === "learn" ? "active" : ""}`}
-              onClick={() => setTab("learn")}
-            >
-              🧠 Learn More
-            </div>
-            <div style={{ flex: 1 }} />
-            <button className="button" onClick={copyCurrent}>
-              Copy
-            </button>
-            <button className="button" onClick={downloadMd}>
-              Download
-            </button>
-          </div>
-
-          {tab === "summary" && (
-            <section>
-              <h3>📚 Summary</h3>
-              <p>{summary}</p>
-            </section>
-          )}
-          {tab === "key" && (
-            <section>
-              <h3>🔑 Key Points</h3>
-              <ul>
-                {key_points.map((p, i) => (
-                  <li key={i}>{p}</li>
-                ))}
-              </ul>
-            </section>
-          )}
-          {tab === "eli5" && (
-            <section>
-              <h3>👶 Explain Like I'm 5</h3>
-              <p>{eli5}</p>
-            </section>
-          )}
-          {tab === "action" && (
-            <section>
-              <h3>📌 Action Items</h3>
-              <ul>
-                {action_items.map((a, i) => (
-                  <li key={i}>{a}</li>
-                ))}
-              </ul>
-            </section>
-          )}
-          {tab === "learn" && (
-            <section>
-              <h3>🧠 Learn More</h3>
-              {learnResults.loading && (
-                <div style={{ color: "#94a3b8", marginBottom: 8 }}>Searching…</div>
-              )}
-              <ul>
-                {(learnResults.items.length ? learnResults.items : fallbackLearnLinks).map((l, i) => (
-                  <li key={i}>
-                    <a href={l.url} target="_blank" rel="noreferrer">
-                      {l.title || l.label || l.url}
-                    </a>
-                  </li>
-                ))}
-              </ul>
-            </section>
-          )}
-
-          <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 16 }}>
-            <button className="button" onClick={() => setMode("chat")}>
-              💬 Ask about the paper
-            </button>
+    <div className="workspace">
+      <aside className="card workspace-sidebar">
+        <div className="sidebar-section">
+          <div className="sidebar-kicker">Dataset Session</div>
+          <div className="sidebar-title">{datasetName}</div>
+          <div className="tabs" style={{ marginTop: 12 }}>
+            <div className="tab active">Chat Ready</div>
+            {summaryReady && <div className="tab">Summary Cached</div>}
           </div>
         </div>
-      )}
 
-      {mode === "chat" && (
-        <>
-          <div className="card results" style={{ paddingBottom: 16 }}>
-            <div className="tabs" style={{ alignItems: "center" }}>
-              <div style={{ fontWeight: 700 }}>Conversation</div>
-              <div style={{ flex: 1 }} />
-              <button className="button" onClick={() => setMode("results")}>
-                Back to Results
-              </button>
+        <div className="sidebar-section">
+          <div className="sidebar-heading">Details</div>
+          <div className="meta-list">
+            <div className="meta-row">
+              <span>Format</span>
+              <strong>{dataset?.format || "Dataset"}</strong>
             </div>
-
-            <div
-              className="chat-container"
-              style={{ display: "flex", flexDirection: "column", gap: 12 }}
-            >
-              <div
-                className="messages"
-                style={{
-                  border: "1px solid rgba(31,41,55,.65)",
-                  borderRadius: 12,
-                  padding: 12,
-                  minHeight: 220,
-                  maxHeight: 360,
-                  overflowY: "auto",
-                  background: "rgba(2,6,23,.25)",
-                }}
-              >
-                {messages.length === 0 && (
-                  <div style={{ color: "#94a3b8" }}>
-                    Ask a question about the paper to begin.
-                  </div>
-                )}
-                {messages.map((m, idx) => (
-                  <div
-                    key={idx}
-                    style={{
-                      marginBottom: 10,
-                      display: "flex",
-                      justifyContent: m.role === "user" ? "flex-end" : "flex-start",
-                    }}
-                  >
-                    <div
-                      style={{
-                        maxWidth: "85%",
-                        padding: "8px 12px",
-                        borderRadius: 12,
-                        background:
-                          m.role === "user"
-                            ? "rgba(59,130,246,.25)"
-                            : "rgba(17,24,39,.6)",
-                        border: "1px solid rgba(31,41,55,.65)",
-                      }}
-                    >
-                      {m.content}
-                    </div>
-                  </div>
-                ))}
-              </div>
-              <form
-                onSubmit={handleSend}
-                className="chat-input-row"
-                style={{ display: "flex", gap: 8 }}
-              >
-                <input
-                  type="text"
-                  value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  placeholder="Type your question about the paper..."
-                  style={{
-                    flex: 1,
-                    padding: "10px 12px",
-                    borderRadius: 10,
-                    border: "1px solid rgba(31,41,55,.65)",
-                  }}
-                />
-                <button className="button" type="submit">
-                  Send
-                </button>
-              </form>
+            <div className="meta-row">
+              <span>Size</span>
+              <strong>{dataset?.size || "Unknown"}</strong>
+            </div>
+            <div className="meta-row">
+              <span>Focus</span>
+              <strong>Chat only</strong>
             </div>
           </div>
+        </div>
 
-          {/* Sidebar and popover */}
-          <Sidebar />
-        </>
-      )}
-    </>
+        <div className="sidebar-section">
+          <div className="sidebar-heading">Notes</div>
+          <div className="sidebar-note">
+            Summary, key points, and other analysis views are hidden for now.
+            If a summary was generated, it stays in the session for later use.
+          </div>
+          <div className="sidebar-note" style={{ marginTop: 10 }}>
+            Supported uploads: PDF, TXT, CSV, and Markdown.
+          </div>
+        </div>
+
+        <div className="sidebar-actions">
+          <button
+            className="button"
+            type="button"
+            onClick={onSelectNewDataset}
+            disabled={loading}
+          >
+            Choose Another Dataset
+          </button>
+          <button
+            className="button secondary"
+            type="button"
+            onClick={onResetDataset}
+            disabled={loading}
+          >
+            Back to Upload
+          </button>
+        </div>
+      </aside>
+
+      <section className="card workspace-main">
+        <div className="panel-header">
+          <div>
+            <div className="badge">Chat Interface</div>
+            <h2 className="panel-title">Chat with your dataset</h2>
+            <div className="panel-subtitle">
+              Load a dataset first, then keep the conversation centered on the
+              content you selected. The chat stays front and center once the
+              dataset is active.
+            </div>
+          </div>
+        </div>
+
+        <div className="messages">
+          {messages.length === 0 && !sending && (
+            <div className="empty-state">
+              Ask a question about <kbd>{datasetName}</kbd> to begin.
+            </div>
+          )}
+
+          {messages.map((message) => (
+            <div
+              key={message.ts}
+              className={`message-row ${message.role}`}
+            >
+              <div className={`message-bubble ${message.role}`}>
+                {message.content}
+              </div>
+            </div>
+          ))}
+
+          {sending && (
+            <div className="message-row assistant">
+              <div className="message-bubble assistant">Thinking...</div>
+            </div>
+          )}
+        </div>
+
+        <form onSubmit={handleSend} className="chat-input-row">
+          <input
+            className="text-input"
+            type="text"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            placeholder={`Ask about ${datasetName}...`}
+            disabled={loading || sending}
+          />
+          <button
+            className="button"
+            type="submit"
+            disabled={loading || sending || !input.trim()}
+          >
+            {sending ? "Thinking..." : "Send"}
+          </button>
+        </form>
+      </section>
+    </div>
   );
 }
-
